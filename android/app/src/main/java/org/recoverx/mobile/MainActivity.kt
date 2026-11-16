@@ -3,6 +3,8 @@ package org.recoverx.mobile
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -41,6 +43,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val Ink = Color(0xFF09121F)
 private val Panel = Color(0xFF121F31)
@@ -59,6 +63,10 @@ data class SelectedDocument(
 data class SelectedFolder(val uri: Uri, val displayName: String)
 
 class MainActivity : ComponentActivity() {
+    private val scanExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var activeCancellation: AtomicBoolean? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -75,7 +83,45 @@ class MainActivity : ComponentActivity() {
                     readDocument = ::readDocument,
                     persistReadAccess = ::persistReadAccess,
                     persistFolderAccess = ::persistFolderAccess,
+                    startScan = ::startScan,
+                    cancelScan = ::cancelScan,
                 )
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        activeCancellation?.set(true)
+        scanExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun cancelScan() {
+        activeCancellation?.set(true)
+    }
+
+    private fun startScan(source: SelectedDocument, destination: SelectedFolder, report: (String) -> Unit) {
+        val cancellation = AtomicBoolean(false)
+        activeCancellation = cancellation
+        scanExecutor.execute {
+            try {
+                val result = ImageCarver(contentResolver).scan(
+                    source.uri, destination.uri, cancellation,
+                ) { bytes, files ->
+                    mainHandler.post {
+                        report("Scanned ${formatBytes(bytes)} · $files complete file${if (files == 1) "" else "s"} found")
+                    }
+                }
+                val status = when {
+                    result.cancelled -> "Scan stopped. ${result.files} complete file${if (result.files == 1) "" else "s"} saved."
+                    result.files == 0 -> "Scan finished. No complete JPEG or PNG files were found."
+                    else -> "Scan finished. ${result.files} complete file${if (result.files == 1) "" else "s"} saved to the chosen folder."
+                }
+                mainHandler.post { report(status) }
+            } catch (error: Exception) {
+                mainHandler.post { report("Scan failed: ${error.message ?: "the selected file or folder is unavailable."}") }
+            } finally {
+                activeCancellation = null
             }
         }
     }
@@ -119,10 +165,14 @@ private fun RecoverXMobileScreen(
     readDocument: (Uri) -> SelectedDocument,
     persistReadAccess: (Uri) -> Unit,
     persistFolderAccess: (Uri) -> Unit,
+    startScan: (SelectedDocument, SelectedFolder, (String) -> Unit) -> Unit,
+    cancelScan: () -> Unit,
 ) {
     var selectedDocument by remember { mutableStateOf<SelectedDocument?>(null) }
     var selectedFolder by remember { mutableStateOf<SelectedFolder?>(null) }
     var validationMessage by remember { mutableStateOf<String?>(null) }
+    var scanMessage by remember { mutableStateOf<String?>(null) }
+    var scanning by remember { mutableStateOf(false) }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -130,7 +180,7 @@ private fun RecoverXMobileScreen(
             val document = readDocument(uri)
             selectedDocument = document
             validationMessage = when {
-                !DiskImagePolicy.isSupportedName(document.displayName) -> "Choose an image ending in IMG, DD, RAW, DMG, E01, 001, or ISO."
+                !DiskImagePolicy.isSupportedName(document.displayName) -> "Choose a raw image ending in IMG, DD, RAW, 001, or ISO."
                 DiskImagePolicy.isKnownEmpty(document.sizeBytes) -> "The selected file is empty."
                 else -> null
             }
@@ -198,27 +248,41 @@ private fun RecoverXMobileScreen(
             }
 
             SectionCard {
-                SectionEyebrow("RECOVERY ENGINE", "PhotoRec for Android is not integrated yet")
+                SectionEyebrow("RECOVERY ENGINE", "Carve JPEG and PNG files")
                 Text(
-                    "This build lets you choose and inspect an image and a destination. It does not start a scan or claim recovered files.",
+                    "Scans the selected image sequentially for complete, contiguous JPEG and PNG files. Fragmented files, other formats, and phone internal storage are not supported by this first engine.",
                     color = Muted,
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
+                scanMessage?.let { InlineMessage(it, if (it.startsWith("Scan failed")) Warning else Mint) }
                 Button(
-                    onClick = {},
-                    enabled = false,
+                    onClick = {
+                        val source = selectedDocument
+                        val destination = selectedFolder
+                        if (!scanning && source != null && destination != null && validationMessage == null) {
+                            scanning = true
+                            scanMessage = "Starting scan…"
+                            startScan(source, destination) { message ->
+                                scanMessage = message
+                                if (!message.startsWith("Scanned ") && message != "Starting scan…") scanning = false
+                            }
+                        } else if (scanning) {
+                            cancelScan()
+                        }
+                    },
+                    enabled = (selectedDocument != null && selectedFolder != null && validationMessage == null) || scanning,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
                 ) {
-                    Text("Recovery scan not available yet", modifier = Modifier.padding(vertical = 4.dp))
+                    Text(if (scanning) "Stop scan" else "Scan image", modifier = Modifier.padding(vertical = 4.dp))
                 }
             }
 
             SectionCard {
                 Text("A note about phone storage", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
                 Text(
-                    "Android limits apps to their own data and files you explicitly select. RecoverX cannot scan private app data or raw internal storage in this version. Use a selected disk-image file for the planned recovery workflow.",
+                    "Android limits apps to their own data and files you explicitly select. RecoverX cannot scan private app data or raw internal storage. Choose a disk image you own and save results in a separate destination.",
                     color = Muted,
                     fontSize = 13.sp,
                     lineHeight = 19.sp,
