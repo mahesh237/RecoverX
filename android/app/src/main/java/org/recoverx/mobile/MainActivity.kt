@@ -395,6 +395,7 @@ private fun RecoverXMobileScreen(
                                     scanMessage = message
                                     if (!message.startsWith("Scanned ") && message != "Starting USB scan…" && !message.startsWith("Waiting for Android")) scanning = false
                                 }
+                            }
                         },
                         enabled = selectedUsbDrive != null || scanning,
                         modifier = Modifier.fillMaxWidth(),
