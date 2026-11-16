@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.net.Uri
 import android.provider.DocumentsContract
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -76,7 +77,8 @@ class ImageCarver(private val resolver: ContentResolver) {
                             val doc = DocumentsContract.createDocument(resolver, destinationTree, mime, "recovered_%04d.%s".format(recovered + 1, ext))
                                 ?: error("The selected folder could not create recovery files.")
                             outputUri = doc
-                            output = resolver.openOutputStream(doc, "w") ?: error("Could not write into the selected folder.")
+                            val target = resolver.openOutputStream(doc, "w") ?: error("Could not write into the selected folder.")
+                            output = BufferedOutputStream(target, OUTPUT_BUFFER_SIZE)
                             val signature = if (start == Candidate.JPEG) JPEG_START else PNG_START
                             signature.forEach { output!!.write(it) }
                             candidateBytes = signature.size.toLong()
@@ -136,6 +138,7 @@ class ImageCarver(private val resolver: ContentResolver) {
 
     companion object {
         private const val BUFFER_SIZE = 64 * 1024
+        private const val OUTPUT_BUFFER_SIZE = 64 * 1024
         private const val MAX_FILE_BYTES = 256L * 1024 * 1024
         private const val PROGRESS_INTERVAL = 4L * 1024 * 1024
         private const val MAX_END_MARKER = 8

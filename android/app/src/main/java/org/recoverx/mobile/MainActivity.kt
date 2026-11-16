@@ -89,10 +89,13 @@ class MainActivity : ComponentActivity() {
             val pending = pendingUsbScan ?: return
             if (device == null || device.deviceId != pending.device.deviceId) return
             pendingUsbScan = null
-            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) &&
+                usbManager.hasPermission(device) &&
+                usbManager.deviceList[device.deviceName]?.deviceId == device.deviceId
+            if (granted) {
                 performUsbScan(device, pending.destination, pending.report)
             } else {
-                pending.report("USB access was not granted. Approve RecoverX in Android’s USB permission prompt to scan this drive.")
+                pending.report("USB access was not granted or the drive was disconnected. Reconnect it and approve RecoverX’s permission prompt.")
             }
         }
     }
@@ -101,7 +104,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            // USB permission results are delivered by the system through the PendingIntent.
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_EXPORTED)
         } else {
             @Suppress("DEPRECATION")
             registerReceiver(usbPermissionReceiver, filter)
@@ -192,7 +196,12 @@ class MainActivity : ComponentActivity() {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        usbManager.requestPermission(device, permissionIntent)
+        try {
+            usbManager.requestPermission(device, permissionIntent)
+        } catch (error: Exception) {
+            pendingUsbScan = null
+            report("Could not request USB access: ${error.message ?: "check the connection and try again."}")
+        }
     }
 
     private fun performUsbScan(device: UsbDevice, destination: SelectedFolder, report: (String) -> Unit) {
@@ -326,13 +335,19 @@ private fun RecoverXMobileScreen(
             SectionCard {
                 SectionEyebrow("01  ·  USB OTG SOURCE", "Scan a connected pendrive")
                 Text(
-                    "Connect a USB pendrive with an OTG adapter. RecoverX reads supported USB mass-storage drives directly and never issues write commands to the drive.",
+                    "Connect a USB pendrive with an OTG adapter, refresh, and select it. Choose a recovery folder on a different device before scanning. RecoverX reads supported drives and never issues media-write commands.",
                     color = Muted,
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
                 OutlinedButton(
-                    onClick = { usbDrives = discoverUsbDrives(); selectedUsbDrive = null },
+                    onClick = {
+                        usbDrives = discoverUsbDrives()
+                        selectedUsbDrive = null
+                        usbDestinationConfirmed = false
+                        scanMessage = null
+                    },
+                    enabled = !scanning,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Mint),
@@ -344,6 +359,7 @@ private fun RecoverXMobileScreen(
                         val label = device.productName?.takeIf { it.isNotBlank() } ?: "USB drive · ${device.deviceName}"
                         OutlinedButton(
                             onClick = { selectedUsbDrive = device; usbDestinationConfirmed = false },
+                            enabled = !scanning,
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = if (selectedUsbDrive?.deviceId == device.deviceId) Mint else Color.White),
@@ -365,19 +381,32 @@ private fun RecoverXMobileScreen(
                         onClick = {
                             val device = selectedUsbDrive
                             val destination = selectedFolder
-                            if (!scanning && device != null && destination != null && usbDestinationConfirmed) {
+                            if (scanning) {
+                                cancelScan()
+                            } else if (device != null && destination == null) {
+                                scanMessage = "Choose a recovery folder on your phone or a different drive to continue."
+                                destinationPicker.launch(null)
+                            } else if (device != null && destination != null && !usbDestinationConfirmed) {
+                                scanMessage = "Confirm that the recovery folder is on a different storage device."
+                            } else if (device != null && destination != null) {
                                 scanning = true
                                 scanMessage = "Starting USB scan…"
                                 startUsbScan(device, destination) { message ->
                                     scanMessage = message
                                     if (!message.startsWith("Scanned ") && message != "Starting USB scan…" && !message.startsWith("Waiting for Android")) scanning = false
                                 }
-                            } else if (scanning) cancelScan()
                         },
-                        enabled = (selectedUsbDrive != null && selectedFolder != null && usbDestinationConfirmed) || scanning,
+                        enabled = selectedUsbDrive != null || scanning,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(14.dp),
-                    ) { Text(if (scanning) "Stop USB scan" else "Scan pendrive read only") }
+                    ) {
+                        Text(when {
+                            scanning -> "Stop USB scan"
+                            selectedFolder == null -> "Choose recovery folder to continue"
+                            !usbDestinationConfirmed -> "Confirm separate destination"
+                            else -> "Scan pendrive read only"
+                        })
+                    }
                 }
                 scanMessage?.let { InlineMessage(it, if (it.contains("failed", ignoreCase = true) || it.contains("not granted")) Warning else Mint) }
             }
