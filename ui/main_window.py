@@ -5,15 +5,16 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QListWidget, QProgressBar, QPushButton, QPlainTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.logging_config import configure_logging
-from engines.photorec import PhotoRecAdapter
+from engines.photorec import PhotoRecAdapter, ScanResult
 from services.image_service import validate_image
+from ui.scan_worker import PhotoRecScanWorker
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ class MainWindow(QMainWindow):
         configure_logging()
         self.engine = PhotoRecAdapter()
         self.selected_image: Path | None = None
+        self.selected_destination: Path | None = None
+        self.scan_worker: PhotoRecScanWorker | None = None
+        self.close_when_scan_stops = False
         self.setWindowTitle("RecoverX — Intelligent Data Recovery")
         self.resize(1120, 740)
         self.setMinimumSize(840, 580)
@@ -77,7 +81,7 @@ class MainWindow(QMainWindow):
         label = QLabel("Start a recovery")
         label.setStyleSheet("font-size:19px;font-weight:700")
         card_layout.addWidget(label)
-        card_layout.addWidget(QLabel("RecoverX currently accepts disk image files only. Physical device scanning is not enabled.", objectName="muted"))
+        card_layout.addWidget(QLabel("RecoverX currently scans disk images only. Physical device scanning is not enabled.", objectName="muted"))
         row = QHBoxLayout()
         self.image_label = QLabel("No image selected")
         self.image_label.setObjectName("muted")
@@ -96,16 +100,33 @@ class MainWindow(QMainWindow):
         self.scan_button = QPushButton("Start PhotoRec recovery", objectName="primary")
         self.scan_button.clicked.connect(self.start_recovery)
         controls.addWidget(self.scan_button)
+        self.cancel_button = QPushButton("Cancel scan")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_recovery)
+        controls.addWidget(self.cancel_button)
         card_layout.addLayout(controls)
         layout.addWidget(card)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+        layout.addWidget(QLabel("Recovered files"))
+        self.results = QListWidget()
+        layout.addWidget(self.results, 1)
 
         info = QFrame(objectName="card")
         info_layout = QVBoxLayout(info)
         info_layout.addWidget(QLabel("Engine status"))
         info_layout.addWidget(QLabel(engine_status.message, objectName="muted"))
-        info_layout.addWidget(QLabel("Scans are not yet enabled because a verified, noninteractive Windows PhotoRec CLI workflow is not available. RecoverX will not report fabricated progress or results.", objectName="muted"))
+        info_layout.addWidget(QLabel("PhotoRec runs through its documented scripted interface. Scan percentage is not available; recovered files are listed from actual output.", objectName="muted"))
+        self.engine_log = QPlainTextEdit()
+        self.engine_log.setReadOnly(True)
+        self.engine_log.setMaximumBlockCount(500)
+        self.engine_log.setPlaceholderText("PhotoRec output will appear here.")
+        self.engine_log.setMaximumHeight(120)
+        info_layout.addWidget(self.engine_log)
         layout.addWidget(info)
-        layout.addStretch()
         outer.addWidget(content, 1)
         self.setCentralWidget(shell)
 
@@ -132,7 +153,78 @@ class MainWindow(QMainWindow):
     def choose_destination(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose a separate recovery destination")
         if folder:
-            self.destination_label.setText(f"Recovery destination: {Path(folder)}")
+            self.selected_destination = Path(folder).resolve()
+            self.destination_label.setText(f"Recovery destination: {self.selected_destination}")
 
     def start_recovery(self) -> None:
-        QMessageBox.information(self, "PhotoRec integration status", "No scan was started. Automated scanning is disabled until the installed PhotoRec CLI and safe read-only invocation are verified.")
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            return
+        if self.selected_image is None or self.selected_destination is None:
+            QMessageBox.warning(self, "Select recovery paths", "Choose a disk image and a destination folder first.")
+            return
+        try:
+            PhotoRecAdapter.validate_inputs(self.selected_image, self.selected_destination)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Recovery path check", str(exc))
+            return
+        engine_status = self.engine.status()
+        if not engine_status.available:
+            QMessageBox.warning(self, "PhotoRec unavailable", engine_status.message)
+            return
+
+        self.results.clear()
+        self.engine_log.clear()
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("PhotoRec scanning — percentage unavailable")
+        self.scan_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        log.info("User started image recovery: %s", self.selected_image)
+        self.scan_worker = PhotoRecScanWorker(self.engine, str(self.selected_image), str(self.selected_destination))
+        self.scan_worker.output_line.connect(self.engine_log.appendPlainText)
+        self.scan_worker.completed.connect(self.recovery_completed)
+        self.scan_worker.failed.connect(self.recovery_failed)
+        self.scan_worker.finished.connect(self.scan_thread_finished)
+        self.scan_worker.start()
+
+    def cancel_recovery(self) -> None:
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            self.cancel_button.setEnabled(False)
+            self.progress.setFormat("Stopping PhotoRec…")
+            self.scan_worker.cancel()
+
+    def recovery_completed(self, result: ScanResult) -> None:
+        for recovered_file in result.recovered_files:
+            self.results.addItem(str(recovered_file))
+        count = len(result.recovered_files)
+        if result.cancelled:
+            summary = f"Scan cancelled. {count} recovered file(s) found in {result.output_directory}."
+        elif result.return_code == 0:
+            summary = f"Scan complete. {count} recovered file(s) found in {result.output_directory}."
+        else:
+            summary = f"PhotoRec exited with code {result.return_code}. {count} output file(s) found in {result.output_directory}."
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.progress.setFormat(summary)
+        log.info("%s", summary)
+
+    def recovery_failed(self, message: str) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFormat("Recovery failed")
+        log.error("PhotoRec recovery failed: %s", message)
+        QMessageBox.critical(self, "Recovery failed", message)
+
+    def scan_thread_finished(self) -> None:
+        self.scan_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.scan_worker = None
+        if self.close_when_scan_stops:
+            self.close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            self.close_when_scan_stops = True
+            self.cancel_recovery()
+            event.ignore()
+            return
+        event.accept()

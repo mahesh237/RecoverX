@@ -6,3 +6,4 @@
 - Added PhotoRec discovery adapter; recovery execution remains disabled pending CLI verification.
 - Added disk image validation and isolated unit tests.
 - Added setup, architecture, user and third-party documentation.
+- Added documented scripted PhotoRec image scans, cancellation, result discovery, and real-engine CI coverage.

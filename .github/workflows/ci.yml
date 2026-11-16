@@ -47,3 +47,24 @@ jobs:
         run: python -m pip install -r requirements.txt pyinstaller
       - name: Build application bundle
         run: pyinstaller --noconfirm --clean --windowed --name RecoverX main.py
+
+  photorec-integration:
+    name: PhotoRec image recovery integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install PhotoRec
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y testdisk
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Recover a fixture from a disposable image
+        env:
+          RECOVERX_RUN_PHOTOREC_TESTS: '1'
+        run: python -m pytest -q tests/test_photorec_integration.py

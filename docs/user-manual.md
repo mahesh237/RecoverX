@@ -1,5 +1,5 @@
 # User manual (MVP)
 
-Launch with `python main.py`. The dashboard reports whether a PhotoRec executable is discoverable. Use **Choose disk image** to select a non-empty image with an accepted extension and **Choose destination** to select a folder. The current version does not start a scan; the action reports that scanning is disabled. Do not use this MVP to recover data.
+Launch with `python main.py`. Install PhotoRec/TestDisk separately and ensure its executable is on PATH. Use **Choose disk image** to select a non-empty image with an accepted extension and **Choose destination** to select a folder on a different storage device. Select **Start PhotoRec recovery** to run a scripted full-image scan. **Cancel scan** terminates PhotoRec. The dashboard shows engine output and lists recovered files created during the run. PhotoRec does not provide a reliable percentage through this interface, so progress is shown as indeterminate.
 
-The image selection checks extension, file existence, and non-zero size only. It does not validate image contents, filesystem support, or recoverability.
+The image selection checks extension, file existence, and non-zero size only. It does not validate image contents, filesystem support, or recoverability. RecoverX only passes regular image files to PhotoRec; it does not scan physical drives. Save the source image and destination to separate devices. PhotoRec creates a numbered `RecoverX_...` output directory. Review recovered files before relying on them; signature carving may produce incomplete or unrelated matches.
