@@ -1,7 +1,14 @@
 package org.recoverx.mobile
 
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.app.PendingIntent
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -26,6 +33,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -65,10 +73,40 @@ data class SelectedFolder(val uri: Uri, val displayName: String)
 class MainActivity : ComponentActivity() {
     private val scanExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val usbManager by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
     private var activeCancellation: AtomicBoolean? = null
+    private var pendingUsbScan: PendingUsbScan? = null
+    private var usbReceiverRegistered = false
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_USB_PERMISSION) return
+            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+            }
+            val pending = pendingUsbScan ?: return
+            if (device == null || device.deviceId != pending.device.deviceId) return
+            pendingUsbScan = null
+            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                performUsbScan(device, pending.destination, pending.report)
+            } else {
+                pending.report("USB access was not granted. Approve RecoverX in Android’s USB permission prompt to scan this drive.")
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(usbPermissionReceiver, filter)
+        }
+        usbReceiverRegistered = true
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(
                 background = Ink,
@@ -84,6 +122,8 @@ class MainActivity : ComponentActivity() {
                     persistReadAccess = ::persistReadAccess,
                     persistFolderAccess = ::persistFolderAccess,
                     startScan = ::startScan,
+                    discoverUsbDrives = ::discoverUsbDrives,
+                    startUsbScan = ::requestUsbScan,
                     cancelScan = ::cancelScan,
                 )
             }
@@ -92,12 +132,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         activeCancellation?.set(true)
+        pendingUsbScan = null
+        if (usbReceiverRegistered) unregisterReceiver(usbPermissionReceiver)
         scanExecutor.shutdownNow()
         super.onDestroy()
     }
 
     private fun cancelScan() {
         activeCancellation?.set(true)
+        pendingUsbScan?.report("USB scan cancelled before USB access was granted.")
+        pendingUsbScan = null
     }
 
     private fun startScan(source: SelectedDocument, destination: SelectedFolder, report: (String) -> Unit) {
@@ -120,6 +164,58 @@ class MainActivity : ComponentActivity() {
                 mainHandler.post { report(status) }
             } catch (error: Exception) {
                 mainHandler.post { report("Scan failed: ${error.message ?: "the selected file or folder is unavailable."}") }
+            } finally {
+                activeCancellation = null
+            }
+        }
+    }
+
+    private fun discoverUsbDrives(): List<UsbDevice> = usbManager.deviceList.values
+        .filter(UsbMassStorageInputStream::isSupported)
+        .sortedBy { it.deviceName }
+
+    private fun requestUsbScan(device: UsbDevice, destination: SelectedFolder, report: (String) -> Unit) {
+        if (!UsbMassStorageInputStream.isSupported(device)) {
+            report("This USB device does not expose a supported read-only mass-storage interface.")
+            return
+        }
+        if (usbManager.hasPermission(device)) {
+            performUsbScan(device, destination, report)
+            return
+        }
+        pendingUsbScan = PendingUsbScan(device, destination, report)
+        report("Waiting for Android’s USB permission prompt…")
+        val intent = Intent(ACTION_USB_PERMISSION).setPackage(packageName)
+        val permissionIntent = PendingIntent.getBroadcast(
+            this,
+            device.deviceId,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        usbManager.requestPermission(device, permissionIntent)
+    }
+
+    private fun performUsbScan(device: UsbDevice, destination: SelectedFolder, report: (String) -> Unit) {
+        val cancellation = AtomicBoolean(false)
+        activeCancellation = cancellation
+        scanExecutor.execute {
+            try {
+                val input = UsbMassStorageInputStream.open(usbManager, device)
+                val result = input.use {
+                    ImageCarver(contentResolver).scanStream(it, destination.uri, cancellation) { bytes, files ->
+                        mainHandler.post {
+                            report("Scanned ${formatBytes(bytes)} of USB drive · $files complete file${if (files == 1) "" else "s"} found")
+                        }
+                    }
+                }
+                val status = when {
+                    result.cancelled -> "USB scan stopped. ${result.files} complete file${if (result.files == 1) "" else "s"} saved."
+                    result.files == 0 -> "USB scan finished. No complete JPEG or PNG files were found."
+                    else -> "USB scan finished. ${result.files} complete file${if (result.files == 1) "" else "s"} saved to the chosen destination."
+                }
+                mainHandler.post { report(status) }
+            } catch (error: Exception) {
+                mainHandler.post { report("USB scan failed: ${error.message ?: "the drive could not be read."}") }
             } finally {
                 activeCancellation = null
             }
@@ -160,12 +256,22 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private data class PendingUsbScan(
+    val device: UsbDevice,
+    val destination: SelectedFolder,
+    val report: (String) -> Unit,
+)
+
+private const val ACTION_USB_PERMISSION = "org.recoverx.mobile.USB_PERMISSION"
+
 @Composable
 private fun RecoverXMobileScreen(
     readDocument: (Uri) -> SelectedDocument,
     persistReadAccess: (Uri) -> Unit,
     persistFolderAccess: (Uri) -> Unit,
     startScan: (SelectedDocument, SelectedFolder, (String) -> Unit) -> Unit,
+    discoverUsbDrives: () -> List<UsbDevice>,
+    startUsbScan: (UsbDevice, SelectedFolder, (String) -> Unit) -> Unit,
     cancelScan: () -> Unit,
 ) {
     var selectedDocument by remember { mutableStateOf<SelectedDocument?>(null) }
@@ -173,6 +279,9 @@ private fun RecoverXMobileScreen(
     var validationMessage by remember { mutableStateOf<String?>(null) }
     var scanMessage by remember { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var usbDrives by remember { mutableStateOf(discoverUsbDrives()) }
+    var selectedUsbDrive by remember { mutableStateOf<UsbDevice?>(null) }
+    var usbDestinationConfirmed by remember { mutableStateOf(false) }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -191,6 +300,7 @@ private fun RecoverXMobileScreen(
             persistFolderAccess(uri)
             val name = uri.lastPathSegment?.substringAfterLast(':')?.takeIf { it.isNotBlank() } ?: "Selected folder"
             selectedFolder = SelectedFolder(uri, name)
+            usbDestinationConfirmed = false
         }
     }
 
@@ -205,7 +315,7 @@ private fun RecoverXMobileScreen(
             TopBar()
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Recover what matters.", fontSize = 31.sp, lineHeight = 36.sp, fontWeight = FontWeight.Bold)
-                Text("A private, image-first recovery workspace for Android.", color = Muted, fontSize = 15.sp)
+                Text("A private USB and image recovery workspace for Android.", color = Muted, fontSize = 15.sp)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusPill("ON DEVICE", Mint)
@@ -214,7 +324,66 @@ private fun RecoverXMobileScreen(
             }
 
             SectionCard {
-                SectionEyebrow("01  ·  SOURCE IMAGE", "Select a disk image")
+                SectionEyebrow("01  ·  USB OTG SOURCE", "Scan a connected pendrive")
+                Text(
+                    "Connect a USB pendrive with an OTG adapter. RecoverX reads supported USB mass-storage drives directly and never issues write commands to the drive.",
+                    color = Muted,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+                OutlinedButton(
+                    onClick = { usbDrives = discoverUsbDrives(); selectedUsbDrive = null },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Mint),
+                ) { Text("Refresh connected drives") }
+                if (usbDrives.isEmpty()) {
+                    Text("No supported USB mass-storage drive detected. Your phone must support USB OTG.", color = Muted, fontSize = 12.sp)
+                } else {
+                    usbDrives.forEach { device ->
+                        val label = device.productName?.takeIf { it.isNotBlank() } ?: "USB drive · ${device.deviceName}"
+                        OutlinedButton(
+                            onClick = { selectedUsbDrive = device; usbDestinationConfirmed = false },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = if (selectedUsbDrive?.deviceId == device.deviceId) Mint else Color.White),
+                        ) { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    }
+                }
+                if (selectedUsbDrive != null) {
+                    Text(
+                        "Choose a recovery folder on the phone or another drive. Saving recovered files back to the pendrive being scanned can overwrite recoverable data.",
+                        color = Warning,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = usbDestinationConfirmed, onCheckedChange = { usbDestinationConfirmed = it })
+                        Text("My recovery folder is on a different storage device", color = Muted, fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            val device = selectedUsbDrive
+                            val destination = selectedFolder
+                            if (!scanning && device != null && destination != null && usbDestinationConfirmed) {
+                                scanning = true
+                                scanMessage = "Starting USB scan…"
+                                startUsbScan(device, destination) { message ->
+                                    scanMessage = message
+                                    if (!message.startsWith("Scanned ") && message != "Starting USB scan…" && !message.startsWith("Waiting for Android")) scanning = false
+                                }
+                            } else if (scanning) cancelScan()
+                        },
+                        enabled = (selectedUsbDrive != null && selectedFolder != null && usbDestinationConfirmed) || scanning,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                    ) { Text(if (scanning) "Stop USB scan" else "Scan pendrive read only") }
+                }
+                scanMessage?.let { InlineMessage(it, if (it.contains("failed", ignoreCase = true) || it.contains("not granted")) Warning else Mint) }
+            }
+
+            SectionCard {
+                SectionEyebrow("02  ·  SOURCE IMAGE", "Or select a disk image")
                 Text("Choose a file you own from this device, an SD card, or a connected storage provider.", color = Muted, fontSize = 14.sp)
                 selectedDocument?.let { DocumentSummary(it) }
                 validationMessage?.let { InlineMessage(it, Warning) }
@@ -229,7 +398,7 @@ private fun RecoverXMobileScreen(
             }
 
             SectionCard {
-                SectionEyebrow("02  ·  SAFE DESTINATION", "Choose a recovery folder")
+                SectionEyebrow("03  ·  SAFE DESTINATION", "Choose a recovery folder")
                 Text(selectedFolder?.displayName ?: "Pick a folder where future recovered files can be saved.", color = Muted, fontSize = 14.sp)
                 OutlinedButton(
                     onClick = { destinationPicker.launch(null) },
@@ -240,7 +409,7 @@ private fun RecoverXMobileScreen(
                     Text(if (selectedFolder == null) "Choose folder" else "Change folder")
                 }
                 Text(
-                    "The scan engine will require a destination on storage separate from the source image.",
+                    "Save recovered files on a storage device separate from the source image or pendrive.",
                     color = Muted,
                     fontSize = 12.sp,
                     lineHeight = 17.sp,

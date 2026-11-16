@@ -40,6 +40,7 @@ class ImageCarver(private val resolver: ContentResolver) {
         val prefix = ArrayDeque<Int>()
         var lastProgress = 0L
         var stopped = false
+        val inputBuffer = ByteArray(BUFFER_SIZE)
 
         fun discardCandidate() {
             runCatching { output?.close() }
@@ -53,60 +54,63 @@ class ImageCarver(private val resolver: ContentResolver) {
 
         try {
             while (!cancelled.get()) {
-                val next = stream.read()
-                if (next < 0) break
-                val byte = next and 0xff
-                scanned++
+                val count = stream.read(inputBuffer)
+                if (count < 0) break
+                for (index in 0 until count) {
+                    if (cancelled.get()) break
+                    val byte = inputBuffer[index].toInt() and 0xff
+                    scanned++
 
-                if (candidate == null) {
-                    prefix.addLast(byte)
-                    while (prefix.size > PNG_START.size) prefix.removeFirst()
-                    val start = when {
-                        endsWith(prefix, JPEG_START) -> Candidate.JPEG
-                        endsWith(prefix, PNG_START) -> Candidate.PNG
-                        else -> null
-                    }
-                    if (start != null) {
-                        candidate = start
-                        val mime = if (start == Candidate.JPEG) "image/jpeg" else "image/png"
-                        val ext = if (start == Candidate.JPEG) "jpg" else "png"
-                        val doc = DocumentsContract.createDocument(resolver, destinationTree, mime, "recovered_%04d.%s".format(recovered + 1, ext))
-                            ?: error("The selected folder could not create recovery files.")
-                        outputUri = doc
-                        output = resolver.openOutputStream(doc, "w") ?: error("Could not write into the selected folder.")
-                        val signature = if (start == Candidate.JPEG) JPEG_START else PNG_START
-                        signature.forEach { output!!.write(it) }
-                        candidateBytes = signature.size.toLong()
-                        tail.clear()
-                    }
-                } else {
-                    output!!.write(byte)
-                    candidateBytes++
-                    tail.addLast(byte)
-                    while (tail.size > MAX_END_MARKER) tail.removeFirst()
+                    if (candidate == null) {
+                        prefix.addLast(byte)
+                        while (prefix.size > PNG_START.size) prefix.removeFirst()
+                        val start = when {
+                            endsWith(prefix, JPEG_START) -> Candidate.JPEG
+                            endsWith(prefix, PNG_START) -> Candidate.PNG
+                            else -> null
+                        }
+                        if (start != null) {
+                            candidate = start
+                            val mime = if (start == Candidate.JPEG) "image/jpeg" else "image/png"
+                            val ext = if (start == Candidate.JPEG) "jpg" else "png"
+                            val doc = DocumentsContract.createDocument(resolver, destinationTree, mime, "recovered_%04d.%s".format(recovered + 1, ext))
+                                ?: error("The selected folder could not create recovery files.")
+                            outputUri = doc
+                            output = resolver.openOutputStream(doc, "w") ?: error("Could not write into the selected folder.")
+                            val signature = if (start == Candidate.JPEG) JPEG_START else PNG_START
+                            signature.forEach { output!!.write(it) }
+                            candidateBytes = signature.size.toLong()
+                            tail.clear()
+                        }
+                    } else {
+                        output!!.write(byte)
+                        candidateBytes++
+                        tail.addLast(byte)
+                        while (tail.size > MAX_END_MARKER) tail.removeFirst()
 
-                    val complete = when (candidate ?: continue) {
-                        Candidate.JPEG -> endsWith(tail, JPEG_END)
-                        Candidate.PNG -> endsWith(tail, PNG_END)
+                        val complete = when (candidate ?: continue) {
+                            Candidate.JPEG -> endsWith(tail, JPEG_END)
+                            Candidate.PNG -> endsWith(tail, PNG_END)
+                        }
+                        if (complete) {
+                            output!!.flush()
+                            output!!.close()
+                            output = null
+                            outputUri = null
+                            recovered++
+                            candidate = null
+                            candidateBytes = 0L
+                            tail.clear()
+                            prefix.clear()
+                        } else if (candidateBytes > MAX_FILE_BYTES) {
+                            discardCandidate()
+                        }
                     }
-                    if (complete) {
-                        output!!.flush()
-                        output!!.close()
-                        output = null
-                        outputUri = null
-                        recovered++
-                        candidate = null
-                        candidateBytes = 0L
-                        tail.clear()
-                        prefix.clear()
-                    } else if (candidateBytes > MAX_FILE_BYTES) {
-                        discardCandidate()
-                    }
-                }
 
-                if (scanned - lastProgress >= PROGRESS_INTERVAL) {
-                    onProgress(scanned, recovered)
-                    lastProgress = scanned
+                    if (scanned - lastProgress >= PROGRESS_INTERVAL) {
+                        onProgress(scanned, recovered)
+                        lastProgress = scanned
+                    }
                 }
             }
             stopped = cancelled.get()

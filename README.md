@@ -1,12 +1,12 @@
 # RecoverX
 
-RecoverX is a free, local-first data recovery project. The Windows desktop MVP provides a PySide6 dashboard, disk-image selection and validation, scripted PhotoRec scans on disk images, a separate destination workflow, scan cancellation, a selectable recovery-results table, and background file copying with SHA-256 verification. An Android app is now under development in `android/`.
+RecoverX is a free, local-first data recovery project. The Windows desktop MVP provides a PySide6 dashboard, disk-image selection and validation, scripted PhotoRec scans on disk images, a separate destination workflow, scan cancellation, a selectable recovery-results table, and background file copying with SHA-256 verification. The Android app in `android/` can scan supported USB OTG drives and raw disk images for contiguous JPEG and PNG files.
 
 ## Current status
 
 The application currently supports image-only PhotoRec file carving when PhotoRec/TestDisk is separately installed and on PATH. Recovered files can be selected and copied to a different device; RecoverX verifies copied size and SHA-256 and avoids overwriting existing files. Physical-device scanning, preview, history, and other engines are not implemented. PhotoRec does not expose a reliable percentage in scripted mode; RecoverX shows an indeterminate scan state and lists files actually created by PhotoRec.
 
-The Android app currently provides a mobile dashboard and Android file/folder selection. It does **not** scan yet; PhotoRec has not been ported to Android. It cannot recover deleted files from phone-internal storage or other apps' private directories.
+The Android app uses a limited signature carver, not PhotoRec. USB scans require an OTG-capable phone and a supported USB Mass Storage Bulk-Only Transport device. It cannot recover fragmented files or scan phone-internal storage and other apps' private directories.
 
 Only non-empty image files with extensions IMG, DD, RAW, DMG, E01, 001, or ISO can currently be selected. Selection checks do not certify that a particular PhotoRec build can parse each format. PhotoRec 7.2 has been verified with raw `.img` input; CI repeats a real JPEG carve against PhotoRec on Ubuntu.
 
